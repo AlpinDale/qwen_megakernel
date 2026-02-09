@@ -158,13 +158,24 @@ class Decoder:
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         for tid in ids[:-1]:
             self.step(tid)
-        out, tok = [], ids[-1]
+        _gen = torch.ops.qwen_megakernel_C.generate_nosync
+        output_ids = _gen(
+            ids[-1], max_tokens,
+            self._embed_weight, self._layer_weights_packed,
+            self._final_norm_weight, self._lm_head_weight,
+            self._cos_table, self._sin_table,
+            self._k_cache, self._v_cache,
+            self._hidden, self._act, self._res,
+            self._q, self._k, self._v, self._attn_out,
+            self._mlp_inter, self._norm_out,
+            self._bmax_vals, self._bmax_idxs,
+            NUM_LAYERS, self._position, MAX_SEQ_LEN, self._attn_scale,
+        )
+        self._position += max_tokens
+        out = output_ids.cpu().tolist()
         eos = self.tokenizer.eos_token_id
-        for _ in range(max_tokens):
-            tok = self.step(tok)
-            if tok == eos:
-                break
-            out.append(tok)
+        if eos in out:
+            out = out[:out.index(eos)]
         return self.tokenizer.decode(out, skip_special_tokens=True)
 
 

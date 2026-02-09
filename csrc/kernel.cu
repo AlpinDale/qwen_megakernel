@@ -49,21 +49,6 @@ constexpr float LDG_RMS_EPS = 1e-6f;
 // LM head
 constexpr int LDG_VOCAB_SIZE = 151936;
 
-constexpr int LDG_PHASE_COUNT = 6;
-
-// L2 prefetch cache hints (from CUTLASS / NVIDIA docs)
-constexpr uint64_t LDG_EVICT_NORMAL = 0x1000000000000000;
-constexpr uint64_t LDG_EVICT_FIRST = 0x12F0000000000000;
-constexpr uint64_t LDG_EVICT_LAST = 0x14F0000000000000;
-
-#ifndef LDG_PREFETCH_CHUNK_BYTES
-#define LDG_PREFETCH_CHUNK_BYTES 4096
-#endif
-
-#ifndef LDG_PREFETCH_DISTANCE
-#define LDG_PREFETCH_DISTANCE 1
-#endif
-
 struct LDGLayerWeights {
   const __nv_bfloat16 *input_layernorm_weight;
   const __nv_bfloat16 *q_proj_weight;
@@ -143,53 +128,13 @@ __device__ __forceinline__ float ldg_silu(float x) {
   return x * ptx_rcp(1.0f + fast_exp(-x));
 }
 
-#ifndef LDG_PREFETCH_L2_POLICY
-#define LDG_PREFETCH_L2_POLICY LDG_EVICT_LAST
-#endif
-
-__device__ __forceinline__ void ldg_prefetch_l2(const void *src, int bytes,
-                                                uint64_t cache_policy) {
-  (void)src;
-  (void)bytes;
-  (void)cache_policy;
-}
-
-__device__ __forceinline__ void ldg_prefetch_row(const __nv_bfloat16 *row,
-                                                 int elements) {
-  (void)row;
-  (void)elements;
-}
-
-// Cache-hinted weight loads (optional)
-__device__ __forceinline__ uint2 ldg_load_weight_u2(const uint2 *ptr) {
-  uint2 out;
-  asm volatile("ld.global.L1::no_allocate.v2.b32 {%0, %1}, [%2];"
-               : "=r"(out.x), "=r"(out.y)
-               : "l"(ptr));
-  return out;
-}
-
+// 128-bit L1-bypassing weight loads
 __device__ __forceinline__ uint4 ldg_load_weight_u4(const uint4 *ptr) {
   uint4 out;
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0, %1, %2, %3}, [%4];"
                : "=r"(out.x), "=r"(out.y), "=r"(out.z), "=r"(out.w)
                : "l"(ptr));
   return out;
-}
-
-__device__ __forceinline__ void ldg_load_weight_u8(unsigned int out[8],
-                                                   const __nv_bfloat16 *ptr) {
-  // v8.b32 (256-bit) not supported on sm_120; use two 128-bit loads.
-  uint4 lo = ldg_load_weight_u4(reinterpret_cast<const uint4 *>(ptr));
-  uint4 hi = ldg_load_weight_u4(reinterpret_cast<const uint4 *>(ptr) + 1);
-  out[0] = lo.x;
-  out[1] = lo.y;
-  out[2] = lo.z;
-  out[3] = lo.w;
-  out[4] = hi.x;
-  out[5] = hi.y;
-  out[6] = hi.z;
-  out[7] = hi.w;
 }
 
 // =============================================================================
@@ -1122,6 +1067,22 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
   }
 }
 
+// Device-side step update: copies LM head output -> next token input,
+// increments position, logs output token. Uses device-side step counter
+// so the kernel arg is fixed (graph-compatible).
+__global__ void ldg_update_step(const int *__restrict__ lm_output,
+                                int *__restrict__ d_token_id,
+                                int *__restrict__ d_position,
+                                int *__restrict__ output_log,
+                                int *__restrict__ d_step_counter) {
+  int tok = *lm_output;
+  int step = *d_step_counter;
+  *d_token_id = tok;
+  *d_position = *d_position + 1;
+  output_log[step] = tok;
+  *d_step_counter = step + 1;
+}
+
 // =============================================================================
 // Launch functions
 // =============================================================================
@@ -1192,6 +1153,70 @@ extern "C" void launch_ldg_decode_persistent(
   ldg_lm_head_phase2<<<1, 256, 0, stream>>>((const float *)block_max_vals,
                                             (const int *)block_max_idxs,
                                             output_token_id, LDG_LM_NUM_BLOCKS);
+}
+
+// N-step generate with NO per-step CPU sync. All steps queued back-to-back.
+// The update kernel feeds output_token -> d_token_id on device between steps.
+extern "C" void launch_ldg_generate_nosync(
+    int first_token_id, int num_steps, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs,
+    int *output_log, // device int[num_steps]: all generated tokens
+    int num_layers, int start_position, int max_seq_len, float attn_scale,
+    cudaStream_t stream) {
+
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  // Allocate device-side step counter
+  static int *d_step_counter = nullptr;
+  static int *d_output_token = nullptr;
+  if (!d_step_counter) {
+    cudaMalloc(&d_step_counter, sizeof(int));
+    cudaMalloc(&d_output_token, sizeof(int));
+  }
+  cudaMemsetAsync(d_step_counter, 0, sizeof(int), stream);
+
+  // Set initial position and token_id on device
+  *h_pinned_position = start_position;
+  *h_pinned_token_id = first_token_id;
+  cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+
+  // Launch all N steps back-to-back with NO CPU sync between them.
+  // Each step: persistent kernel -> LM head phase 1 -> LM head phase 2 ->
+  // update
+  for (int step = 0; step < num_steps; step++) {
+    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+        (const __nv_bfloat16 *)embed_weight, layer_weights,
+        (const __nv_bfloat16 *)final_norm_weight,
+        (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+        (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+        (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+        (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+        (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+        d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+        d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
+
+    ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+        (float *)block_max_vals, (int *)block_max_idxs);
+
+    ldg_lm_head_phase2<<<1, 256, 0, stream>>>(
+        (const float *)block_max_vals, (const int *)block_max_idxs,
+        d_output_token, LDG_LM_NUM_BLOCKS);
+
+    // Update step: feed output token back, increment position, log result
+    ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
+                                         d_mutable_position, output_log,
+                                         d_step_counter);
+  }
 }
 
 static inline void ldg_configure_kernel_attributes() {
